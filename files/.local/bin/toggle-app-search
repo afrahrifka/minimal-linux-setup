@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Serialize rapid Super presses so they cannot launch duplicate menus.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/app-search-toggle-${UID}.lock"
+flock 9
+if pgrep -u "$UID" -x fuzzel >/dev/null; then
+    pkill -u "$UID" -x fuzzel
+else
+    fuzzel 9>&- >/dev/null 2>&1 &
+    # Allow the new process to register before the next rapid press.
+    for ((i=0; i<20; i++)); do
+        pgrep -u "$UID" -x fuzzel >/dev/null && break
+        sleep 0.01
+    done
+fi

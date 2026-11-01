@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import subprocess
+from gi.repository import Gio, GLib
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+reply = bus.call_sync('org.freedesktop.login1', '/org/freedesktop/login1',
+    'org.freedesktop.login1.Manager', 'GetSessionByPID',
+    GLib.Variant('(u)', (__import__('os').getpid(),)), GLib.VariantType.new('(o)'),
+    Gio.DBusCallFlags.NONE, -1, None)
+session = reply.unpack()[0]
+def lock(*_):
+    if subprocess.run(['pgrep', '-u', str(__import__('os').getuid()), '-x', 'hyprlock'],
+                      stdout=subprocess.DEVNULL).returncode:
+        subprocess.Popen(['hyprlock'], start_new_session=True)
+bus.signal_subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Session',
+    'Lock', session, None, Gio.DBusSignalFlags.NONE, lock)
+GLib.MainLoop().run()

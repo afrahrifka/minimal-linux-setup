@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Prefer a supported ~60 Hz mode at the current resolution on each monitor."""
+import json
+import re
+import subprocess
+for monitor in json.loads(subprocess.check_output(['hyprctl', '-j', 'monitors'], text=True)):
+    modes = monitor.get('availableModes', [])
+    resolution = f"{monitor['width']}x{monitor['height']}@"
+    for mode in modes:
+        if not mode.startswith(resolution):
+            continue
+        match = re.search(r'@([0-9.]+)', mode)
+        if match and 59 <= float(match.group(1)) <= 61:
+            value = f"{monitor['name']},{mode},auto,{monitor['scale']}"
+            subprocess.run(['hyprctl', 'keyword', 'monitor', value], check=True,
+                           stdout=subprocess.DEVNULL)
+            break

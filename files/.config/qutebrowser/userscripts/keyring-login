@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Save/fill one login per exact web origin using the desktop Secret Service.
+Passwords are never placed on the clipboard, command line, or qute FIFO.
+"""
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+import gi
+gi.require_version('Secret', '1')
+from gi.repository import Secret
+
+SCHEMA = Secret.Schema.new('org.qutebrowser.LocalLogin', Secret.SchemaFlags.NONE,
+                          {'application': Secret.SchemaAttributeType.STRING,
+                           'origin': Secret.SchemaAttributeType.STRING})
+
+def origin_for(url):
+    u = urlsplit(url)
+    if not u.hostname or u.scheme not in ('http', 'https'):
+        raise ValueError('Buka halaman login HTTP/HTTPS terlebih dahulu.')
+    if u.scheme == 'http' and u.hostname not in ('localhost', '127.0.0.1', '::1'):
+        raise ValueError('Gunakan HTTPS untuk mengisi password pada situs ini.')
+    host = u.hostname.encode('idna').decode('ascii').lower()
+    if ':' in host:
+        host = '[' + host + ']'
+    port = u.port
+    suffix = '' if port in (None, 443 if u.scheme == 'https' else 80) else ':' + str(port)
+    return u.scheme + '://' + host + suffix
+
+def tell(message, error=False):
+    with open(os.environ['QUTE_FIFO'], 'w') as fifo:
+        fifo.write(('message-error ' if error else 'message-info ') + json.dumps(message) + '\n')
+
+def fill_code(origin, username, password):
+    data = json.dumps({'origin': origin, 'username': username, 'password': password})
+    return '''(() => {
+    const login = DATA;
+    if (location.origin !== login.origin) return;
+    const visible = e => !e.disabled && e.getClientRects().length > 0;
+    const p = [...document.querySelectorAll('input[type="password"]')].find(visible);
+    if (!p) return;
+    const scope = p.form || document;
+    const inputs = [...scope.querySelectorAll('input')].filter(visible);
+    const u = inputs.find(e => e.autocomplete === 'username') ||
+        inputs.find(e => ['email', 'text', 'tel'].includes(e.type));
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    function set(e, value) {
+        setter.call(e, value);
+        e.dispatchEvent(new Event('input', {bubbles: true}));
+        e.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+    if (u) set(u, login.username);
+    set(p, login.password);
+    p.focus();
+})();'''.replace('DATA', data)
+
+def main():
+    origin = origin_for(os.environ.get('QUTE_URL', ''))
+    attrs = {'application': 'qutebrowser-local-login', 'origin': origin}
+    if len(sys.argv) != 2 or sys.argv[1] not in ('save', 'fill'):
+        raise ValueError('Gunakan keyring-login save atau fill.')
+    action = sys.argv[1]
+    if action == 'save':
+        from PyQt6.QtWidgets import QApplication, QInputDialog, QLineEdit
+        app = QApplication(sys.argv)
+        username, ok = QInputDialog.getText(None, 'Simpan login — ' + origin, 'Username / email:')
+        if not ok or not username:
+            return
+        password, ok = QInputDialog.getText(None, 'Simpan login — ' + origin, 'Password:', QLineEdit.EchoMode.Password)
+        if not ok or not password:
+            return
+        saved = Secret.password_store_sync(SCHEMA, attrs, Secret.COLLECTION_DEFAULT,
+                      'qutebrowser — ' + origin, json.dumps({'username': username, 'password': password}), None)
+        if not saved:
+            raise RuntimeError('Keyring tidak dapat menyimpan akun.')
+        tell('Login tersimpan di keyring. Tekan pf pada formulir untuk mengisinya.')
+    else:
+        secret = Secret.password_lookup_sync(SCHEMA, attrs, None)
+        if secret is None:
+            tell('Belum ada login tersimpan untuk situs ini. Tekan ps untuk menyimpan.', True)
+            return
+        login = json.loads(secret)
+        # Use a private RAM-backed file: credentials do not appear in FIFO commands or debug command logs.
+        runtime = Path(os.environ['XDG_RUNTIME_DIR']) / 'qute-keyring'
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(runtime, 0o700)
+        fd, path = tempfile.mkstemp(prefix='fill-', suffix='.js', dir=runtime)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(fill_code(origin, login['username'], login['password']))
+            with open(os.environ['QUTE_FIFO'], 'w') as fifo:
+                fifo.write('jseval --quiet --file ' + path + '\n')
+            time.sleep(5)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        # Never print exceptions which could contain credential material.
+        tell('Operasi login gagal. Pastikan keyring terbuka dan URL HTTPS (atau localhost).', True)
+        sys.exit(1)
